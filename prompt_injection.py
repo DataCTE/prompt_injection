@@ -7,19 +7,25 @@ import comfy.model_patcher
 import comfy.samplers
 import torch
 
-def build_patch(patchedBlocks):
+def build_patch(patchedBlocks, weight=1.0, sigma_start=0.0, sigma_end=1.0):
     def prompt_injection_patch(n, context_attn1: torch.Tensor, value_attn1, extra_options):
-        (block, block_index) = extra_options.get('block', (None,None)) 
-        
-        if (block and f'{block}:{block_index}' in patchedBlocks and patchedBlocks[f'{block}:{block_index}']):
-            cond = torch.stack(
-                (
-                    context_attn1[0].unsqueeze(0),
-                    patchedBlocks[f'{block}:{block_index}'][0][0].to(context_attn1.device)
-                )
-            ).to(dtype=context_attn1.dtype)
-            return n, cond, cond
-        
+        (block, block_index) = extra_options.get('block', (None,None))
+        sigma = extra_options["sigmas"].detach().cpu()[0].item() if 'sigmas' in extra_options else 999999999.9
+
+        if sigma <= sigma_start and sigma >= sigma_end:
+            if (block and f'{block}:{block_index}' in patchedBlocks and patchedBlocks[f'{block}:{block_index}']):
+                c = context_attn1[0]
+                if c.dim() == 2:
+                    c = c.unsqueeze(0)
+                cond = torch.stack(
+                    (
+                        c,
+                        patchedBlocks[f'{block}:{block_index}'][0][0].to(context_attn1.device)
+                    )
+                ).to(dtype=context_attn1.dtype)
+
+                return n, cond, cond * weight
+
         return n, context_attn1, value_attn1
     return prompt_injection_patch
 
@@ -41,7 +47,10 @@ class PromptInjection:
                 "out2": ("CONDITIONING",),
                 "out3": ("CONDITIONING",),
                 "out4": ("CONDITIONING",),
-                "out5": ("CONDITIONING",)
+                "out5": ("CONDITIONING",),
+                "weight": ("FLOAT", {"default": 1.0, "min": -2.0, "max": 5.0, "step": 0.05}),
+                "start_at": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.001}),
+                "end_at": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.001}),
             }
         }
 
@@ -50,8 +59,11 @@ class PromptInjection:
 
     CATEGORY = "advanced/model"
 
-    def patch(self, model: comfy.model_patcher.ModelPatcher, in4=None, in5=None, in7=None, in8=None, mid0=None, out0=None, out1=None, out2=None, out3=None, out4=None, out5=None):
+    def patch(self, model: comfy.model_patcher.ModelPatcher, in4=None, in5=None, in7=None, in8=None, mid0=None, out0=None, out1=None, out2=None, out3=None, out4=None, out5=None, weight=1.0, start_at=0.0, end_at=1.0):
         m = model.clone()
+        sigma_start = m.get_model_object("model_sampling").percent_to_sigma(start_at)
+        sigma_end = m.get_model_object("model_sampling").percent_to_sigma(end_at)
+
         if any((in4, in5, in7, in8, mid0, out0, out1, out2, out3, out4, out5)):
             patchedBlocks = {
                 'input:4': in4,
@@ -66,7 +78,7 @@ class PromptInjection:
                 'output:4': out4,
                 'output:5': out5,
             }
-            m.set_model_attn2_patch(build_patch(patchedBlocks))
+            m.set_model_attn2_patch(build_patch(patchedBlocks, weight=weight, sigma_start=sigma_start, sigma_end=sigma_end))
 
         return (m,)
 
@@ -79,8 +91,11 @@ class SimplePromptInjection:
             },
             "optional": {
                 "block": (("output", "middle", "input"),),
-                "index": ("INT", {"default": 0, "min": 0, "max": 7, "step": 1}),
-                "conditioning": ("CONDITIONING",)
+                "index": ("INT", {"default": 0, "min": 0, "max": 8, "step": 1}),
+                "conditioning": ("CONDITIONING",),
+                "weight": ("FLOAT", {"default": 1.0, "min": -2.0, "max": 5.0, "step": 0.05}),
+                "start_at": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.001}),
+                "end_at": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.001}),
             }
         }
 
@@ -89,9 +104,15 @@ class SimplePromptInjection:
 
     CATEGORY = "advanced/model"
 
-    def patch(self, model: comfy.model_patcher.ModelPatcher, block, index, conditioning):
+    def patch(self, model: comfy.model_patcher.ModelPatcher, block, index, conditioning=None, weight=1.0, start_at=0.0, end_at=1.0):
+        if not conditioning:
+            return (model,)
+
         m = model.clone()
-        m.set_model_attn2_patch(build_patch({f"{block}:{index}": conditioning}))
+        sigma_start = m.get_model_object("model_sampling").percent_to_sigma(start_at)
+        sigma_end = m.get_model_object("model_sampling").percent_to_sigma(end_at)
+
+        m.set_model_attn2_patch(build_patch({f"{block}:{index}": conditioning}, weight=weight, sigma_start=sigma_start, sigma_end=sigma_end))
 
         return (m,)
 
@@ -103,8 +124,10 @@ class AdvancedPromptInjection:
                 "model": ("MODEL",),
             },
             "optional": {
-                "locations": ("STRING", {"multiline": True, "default": "output:0\noutput:1"}),
-                "conditioning": ("CONDITIONING",)
+                "locations": ("STRING", {"multiline": True, "default": "output:0,1.0\noutput:1,1.0"}),
+                "conditioning": ("CONDITIONING",),
+                "start_at": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.001}),
+                "end_at": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.001}),
             }
         }
 
@@ -113,12 +136,23 @@ class AdvancedPromptInjection:
 
     CATEGORY = "advanced/model"
 
-    def patch(self, model: comfy.model_patcher.ModelPatcher, locations: str, conditioning):
+    def patch(self, model: comfy.model_patcher.ModelPatcher, locations: str, conditioning=None, start_at=0.0, end_at=1.0):
+        if not conditioning:
+            return (model,)
+
         m = model.clone()
-        patched_blocks = {}
+        sigma_start = m.get_model_object("model_sampling").percent_to_sigma(start_at)
+        sigma_end = m.get_model_object("model_sampling").percent_to_sigma(end_at)
+
         for line in locations.splitlines():
-            patched_blocks[line.strip().strip('\n')] = conditioning
-        m.set_model_attn2_patch(build_patch(patched_blocks))
+            line = line.strip().strip('\n')
+            weight = 1.0
+            if ',' in line:
+                line, weight = line.split(',')
+                line = line.strip()
+                weight = float(weight)
+            if line:
+                m.set_model_attn2_patch(build_patch({f"{line}": conditioning}, weight=weight, sigma_start=sigma_start, sigma_end=sigma_end))
 
         return (m,)
 
